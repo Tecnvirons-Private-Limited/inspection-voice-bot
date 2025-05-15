@@ -234,10 +234,3 @@ def book_slot_handler(start_time_str, email):
     except Exception as e:
         logger.error(f"Error booking slot: {e}")
         return {"error": f"Failed to book appointment: {str(e)}"}
-
-# Remove test code that runs on import
-if __name__ == "__main__":
-    # Only run when file is executed directly
-    print("Testing calendar functions:")
-    print("Available slots:", get_available_slots_handler())
-

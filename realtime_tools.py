@@ -1,50 +1,65 @@
-# RAG search function from example.py
+import os
 import logging
 import google.generativeai as genai
 from pinecone import Pinecone
 from dotenv import load_dotenv
-import os
+
 # Load environment variables
-load_dotenv(dotenv_path='.env', override=True)
+load_dotenv()
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-
+# Initialize API keys and constants
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 INDEX_NAME = os.getenv("PINECONE_INDEX_NAME")
-print(f"INDEX_NAME: {INDEX_NAME}")
-# Set up Pinecone
-pc = Pinecone(api_key=PINECONE_API_KEY)
+DEFAULT_NAMESPACE = os.getenv("DEFAULT_NAMESPACE")
+
+# Set up Pinecone client
 try:
+    pc = Pinecone(api_key=PINECONE_API_KEY)
     index = pc.Index(INDEX_NAME)
     logger.info(f"Connected to Pinecone index: {INDEX_NAME}")
 except Exception as e:
     logger.error(f"Pinecone setup error: {e}")
     raise
 
-async def search_product_database(query, namespace=os.getenv("DEFAULT_NAMESPACE")):
-    """Search product information in vector database"""
+async def search_product_database(query, namespace=DEFAULT_NAMESPACE):
+    """
+    Search product information in vector database
+    
+    Args:
+        query (str): The search query about a product
+        namespace (str): The namespace to search in Pinecone
+        
+    Returns:
+        str: Formatted response with product information
+    """
     try:
-        # Logs the query and namespace so developers can see what's being searched.
+        # Log the search request
         logger.info(f"Searching for: '{query}' in namespace '{namespace}'")
+        
+        # Generate embedding for the query
         embed_response = genai.embed_content(
             model="models/text-embedding-004", 
             content=query
         )
         embedding = embed_response["embedding"]
+        
+        # Query Pinecone for similar vectors
         results = index.query(
             vector=embedding,
             namespace=namespace,
             top_k=3,
             include_metadata=True
         )
-        print(f"Search results: {results}")        
+        
+        # Check if we got any results
         if not results["matches"]:
             return "I couldn't find information about that product in our database."
         
+        # Extract text contexts from matches
         contexts = []
         for match in results["matches"]:
             if "text" in match.get("metadata", {}):
@@ -53,7 +68,10 @@ async def search_product_database(query, namespace=os.getenv("DEFAULT_NAMESPACE"
         if not contexts:
             return "I found some matches but they don't contain usable information."
         
+        # Prepare context for summarization
         context_text = "\n---\n".join(contexts)
+        
+        # Generate a summary using the retrieved product information
         summary_prompt = f"""
         Based on these product details:
         {context_text}
@@ -79,6 +97,7 @@ async def search_product_database(query, namespace=os.getenv("DEFAULT_NAMESPACE"
         Also the currency is in INR.
         """
 
+        # Generate response with Gemini
         summary = genai.GenerativeModel("gemini-1.5-flash").generate_content(summary_prompt)
         return summary.text
 
