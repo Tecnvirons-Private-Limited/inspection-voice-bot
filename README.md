@@ -144,15 +144,6 @@ inspection-voice-bot/
 └── README.md            # This file
 ```
 
-## Deployment
-
-The system is designed to be deployed as a web service that can receive webhook calls from Plivo. It can be hosted on platforms like:
-
-- Railway
-- AWS
-- Google Cloud
-- Heroku
-- Digital Ocean
 
 ## Contributing
 
