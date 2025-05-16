@@ -1,10 +1,10 @@
 import os
-import logging
 from dotenv import load_dotenv
-from supabase import create_client
+from supabase import create_client, ClientOptions
+import logging
 
 # Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Load environment variables
@@ -12,8 +12,10 @@ load_dotenv()
 
 # Initialize Supabase client
 supabase_url = os.getenv("SUPABASE_URLL")
-supabase_key = os.getenv("SUPABASE_KEYY")
+supabase_key = os.getenv("SUPABASE_KEYY")  # Using anon key is fine for read operations
 supabase = create_client(supabase_url, supabase_key)
+
+
 
 def does_number_exist(phone_number):
     """
@@ -35,6 +37,7 @@ def does_number_exist(phone_number):
     except Exception as e:
         logger.error(f"Database error while checking if number exists: {str(e)}")
         return False  # Return False on error to be safe
+
 
 def get_user_details(phone_number):
     """
@@ -81,6 +84,17 @@ def get_user_details(phone_number):
             "message": f"Error retrieving user details: {str(e)}",
             "data": None
         }
+    
+# user_info = get_user_details("7884455")
+# if user_info["status"] == "success":
+#     email = user_info["data"]["email"]
+#     name = user_info["data"]["name"]
+#     print(f"User found: {name}, Email: {email}")
+#     # Use other fields as needed
+# else:
+#     # Handle not found, incomplete, or error cases
+#     message = user_info["message"]
+#     print(f"Status: {user_info['status']}, Message: {message}")
 
 def add_phone_with_role(phone_number, role):
     """
@@ -104,16 +118,16 @@ def add_phone_with_role(phone_number, role):
             return {"status": "exists", "message": "Phone number already exists"}
         else:
             # Create a new entry with placeholder values for required fields
+            # Note: This will fail if email is already taken or if constraints aren't met
             new_record = {
                 "phone_number": phone_number,
                 "email": None,  # Placeholder, can be updated later
-                "name": None,   # Placeholder, can be updated later
+                "name": None,  # Placeholder, can be updated later
                 'location': None,  # Placeholder, can be updated later
                 "role": role
             }
             
             insert_response = supabase.table("registration_form").insert(new_record).execute()
-            logger.info(f"Created new user with phone {phone_number} and role {role}")
             return {"status": "created", "message": "New phone number entry created"}
             
     except Exception as e:

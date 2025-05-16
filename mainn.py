@@ -1,77 +1,63 @@
-import os
-import json
-import time
-import asyncio
-import base64
-import logging
-from dotenv import load_dotenv
-import websockets
-import google.generativeai as genai
+import plivo
 from quart import Quart, websocket, Response, request
-
-# Import custom modules
+import asyncio
+import websockets
+import json
+import base64
+import os
+import logging
+import google.generativeai as genai
+from pinecone import Pinecone
+from dotenv import load_dotenv
+import time
 from realtime_tools import search_product_database
+from number import extract_mobile_numbers
 from tools import send_simple_whatsapp, generate_inquiry_invoice, send_templated_message
 from google_calender import get_available_slots_handler, is_slot_available, book_slot_handler
 from tools_two import upload_text_to_pdf_and_get_short_url
-from db import does_number_exist, get_user_details, add_phone_with_role
-
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+from db import does_number_exist, get_user_details, add_phone_with_role  # Import database functions
 
 # Load environment variables
-load_dotenv()
+load_dotenv(dotenv_path='.env', override=True)
 
-# Initialize environment variables
-PORT = int(os.getenv('PORT', 5000))
+# Configure logging
+logging.basicConfig(level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Environment variables and constants
+PORT = 5000
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
+PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
 GENAI_API_KEY = os.getenv("GOOGLE_API_KEY")
+DEFAULT_NAMESPACE = "Tec Nviirons Sample data testing.xlsx 2025-05-02 09:05:24"
 
-# Verify required environment variables
+# Configure APIs
 if not OPENAI_API_KEY:
-    raise ValueError("OPENAI_API_KEY environment variable is not set")
+    raise ValueError("OPENAI_API_KEY environment variable is not set. Please add it to your .env file")
 
-# Configure Gemini API
 genai.configure(api_key=GENAI_API_KEY)
 
-# Define system prompts
-# Define system prompts
-SYSTEM_MESSAGE = """
-You are a helpful assistant for Tec Nvirons who can handle three types of requests:
-1. General chat - respond conversationally to general inquiries.
-2. Product database queries - search the product database when users ask about specific products.
-3. Appointment booking - help users schedule appointments using the calendar functions.
+# System prompt for the assistant
+SYSTEM_MESSAGE = (
+    "You are a helpful assistant for Tec Nvirons who can handle three types of requests: "
+    "1. General chat - respond conversationally to general inquiries. "
+    "2. Product database queries - search the product database when users ask about specific products. "
+    "3. Appointment booking - help users schedule appointments using the calendar functions. "
+    "When users want to book an appointment, either directly verify if their requested time is available, "
+    "or check available slots if they haven't specified a time. "
+    "Book the appointment once a time is confirmed. Always be helpful, friendly, and conversational."
 
-When users want to book an appointment, either directly verify if their requested time is available,
-or check available slots if they haven't specified a time.
-Book the appointment once a time is confirmed.
+)
 
-IMPORTANT CONVERSATION GUIDELINES:
-- You're speaking with users on a phone call. Never read out URLs, links, or long reference IDs.
-- If calendar links or other URLs are included in function responses, simply say "I've booked your appointment" 
-  or "Your appointment details will be sent to you" without reciting the actual links.
-- Before looking up information or performing tasks that may take time, always acknowledge what you're doing with phrases like:
-  * "Let me check that for you. Just a moment."
-  * "Let me look that up in our product database for you. Just a second."
-  * "Let me check if that time is available. One moment."
-  * "I'll book that appointment for you now. Just a moment while I confirm that."
+# Additional system prompts for different scenarios
+NEW_USER_SYSTEM_MESSAGE = (
+    "You are a helpful assistant for Tec Nvirons. I see you're a new caller. "
+    "Before we proceed, I need to know if you're a contractor or a customer. "
+    "Please let me know which one you are, and then I can assist you with "
+    "product information, appointment scheduling, or any other questions you have."
+)
 
-Always be helpful, friendly, and conversational, speaking naturally as a human receptionist would.
-Avoid sounding robotic or automated when handling appointments or sharing information.
-"""
-
-NEW_USER_SYSTEM_MESSAGE = """
-You are a helpful assistant for Tec Nvirons. I see you're a new caller.
-Before we proceed, I need to know if you're a contractor or a customer.
-Please let me know which one you are, and then I can assist you with
-product information, appointment scheduling, or any other questions you have.
-
-Remember, you're speaking on a phone call, so communicate naturally like a human receptionist.
-Never read out URLs, links, or reference numbers verbatim.
-"""
-
-# Initialize Quart app
 app = Quart(__name__)
 
 # Store call data separately for each call UUID
@@ -79,84 +65,69 @@ call_data = {}
 
 @app.route("/webhook", methods=["GET", "POST"])
 async def home():
-    """Handle incoming calls and route to the WebSocket media stream"""
-    try:
-        # Get request values
-        values = await request.values    
-        caller_number = values.get('From', 'unknown')
-        called_number = values.get('To', 'unknown')
-        call_uuid = values.get('CallUUID', 'unknown')
-            
-        # Log the incoming call
-        logger.info(f"Incoming call from {caller_number} to {called_number} (UUID: {call_uuid})")
+    # Timing for request.values
+    values = await request.values    
+    caller_number = values.get('From', 'unknown')
+    called_number = values.get('To', 'unknown')
+    call_uuid = values.get('CallUUID', 'unknown')
         
-        # Check if the caller's number exists in the database
-        user_exists = does_number_exist(caller_number)
-        user_details = None
-        
-        # Set appropriate greeting and system message based on user status
-        if user_exists:
-            # Fetch user details from the database
-            user_details = get_user_details(caller_number)
-            if user_details["status"] == "success":
-                user_name = user_details["data"]["name"]
-                greeting_message = f"Hey {user_name}! Welcome back to Technvi AI. How can I help you today?"
-                logger.info(f"Existing user: {user_name} with email: {user_details['data'].get('email')}")
-                system_message_to_use = SYSTEM_MESSAGE
-            else:
-                greeting_message = "Welcome to Technvi AI! How can I help you today?"
-                system_message_to_use = SYSTEM_MESSAGE
-        else:
-            # For new users, prompt them to specify their role
-            greeting_message = "Welcome to Technvi AI! I see you're a new caller. Are you a contractor or a customer?"
-            system_message_to_use = NEW_USER_SYSTEM_MESSAGE
-            logger.info(f"New user calling from: {caller_number}")
-        
-        # Initialize data structures for this call
-        call_data[call_uuid] = {
-            'caller_number': caller_number,
-            'called_number': called_number,
-            'timestamp': time.time(),
-            'transcriptions': {},
-            'function_calls': [],
-            'assistant_responses': [],
-            'appointments': [],
-            'user_exists': user_exists,
-            'user_details': user_details,
-            'user_role_set': False,  # Flag to track if new user has set their role
-            'system_message': system_message_to_use
-        }
-        
-        # Generate Plivo XML response
-        xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Speak voice="Polly.Amy">{greeting_message}</Speak>
-            <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
-                ws://{request.host}/media-stream/{call_uuid}
-            </Stream>
-        </Response>
-        '''
-        return Response(xml_data, mimetype='application/xml')
-    except Exception as e:
-        logger.error(f"Error in webhook handler: {str(e)}")
-        # Return a simple response in case of error
-        xml_data = '''<?xml version="1.0" encoding="UTF-8"?>
-        <Response>
-            <Speak>Sorry, there was a technical issue. Please try calling again later.</Speak>
-            <Hangup/>
-        </Response>
-        '''
-        return Response(xml_data, mimetype='application/xml')
+    # Log the incoming call
+    print(f"Incoming call from {caller_number} to {called_number} (UUID: {call_uuid})")
+    
+    # Check if the caller's number exists in the database
+    user_exists = does_number_exist(caller_number)
+    user_details = None
+    greeting_message = "Welcome to Technvi AI! Please ask anything you want to know about our products or any other questions you may have."
+    system_message_to_use = SYSTEM_MESSAGE
+    
+    if user_exists:
+        # Fetch user details from the database
+        user_details = get_user_details(caller_number)
+        if user_details["status"] == "success":
+            user_name = user_details["data"]["name"]
+            # Personalized greeting for existing users
+            greeting_message = f"Hey {user_name}! Welcome back to Technvi AI. How can I help you today?"
+            print(f"Existing user: {user_name} with email: {user_details['data'].get('email')}")
+    else:
+        # For new users, prompt them to specify their role
+        greeting_message = "Welcome to Technvi AI! I see you're a new caller. Are you a contractor or a customer?"
+        system_message_to_use = NEW_USER_SYSTEM_MESSAGE
+        print(f"New user calling from: {caller_number}")
+    
+    # Initialize data structures for this call
+    call_data[call_uuid] = {
+        'caller_number': caller_number,
+        'called_number': called_number,
+        'timestamp': time.time(),
+        'transcriptions': {},
+        'function_calls': [],
+        'assistant_responses': [],
+        'appointments': [],
+        'user_exists': user_exists,
+        'user_details': user_details,
+        'user_role_set': False,  # Flag to track if new user has set their role
+        'system_message': system_message_to_use
+    }
+    
+    xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
+    <Response>
+        <Speak voice="Polly.Amy">{greeting_message}</Speak>
+        <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
+            ws://{request.host}/media-stream/{call_uuid}
+        </Stream>
+    </Response>
+    '''
+    return Response(xml_data, mimetype='application/xml')
+
 
 @app.websocket('/media-stream/<call_uuid>')
 async def handle_message(call_uuid):
-    """Handle the WebSocket connection for streaming audio data"""
-    logger.info(f'Client connected for call UUID: {call_uuid}')
+    print(f'Client connected for call UUID: {call_uuid}')
     plivo_ws = websocket 
     
     # Ensure we have data for this call
     if call_uuid not in call_data:
-        logger.warning(f"Warning: No call data found for UUID {call_uuid}, creating empty data")
+        print(f"Warning: No call data found for UUID {call_uuid}, creating empty data")
         call_data[call_uuid] = {
             'caller_number': 'unknown',
             'called_number': 'unknown',
@@ -172,14 +143,15 @@ async def handle_message(call_uuid):
         }
     
     caller_number = call_data[call_uuid]['caller_number']
-    logger.info(f"Processing call from: {caller_number} with UUID: {call_uuid}")
+    print(f"Processing call from: {caller_number} with UUID: {call_uuid}")
     
     # Pass call info to the WebSocket session
     plivo_ws.caller_number = caller_number
     plivo_ws.call_uuid = call_uuid
 
-    # Connect to OpenAI Realtime API
     url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+    # url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -187,79 +159,66 @@ async def handle_message(call_uuid):
 
     try: 
         async with websockets.connect(url, extra_headers=headers) as openai_ws:
-            logger.info(f'Connected to the OpenAI Realtime API for call {call_uuid}')
+            print(f'Connected to the OpenAI Realtime API for call {call_uuid}')
 
-            # Send initial session configuration
             await send_session_update(openai_ws, call_uuid)
             
-            # Create task for receiving from Plivo
             receive_task = asyncio.create_task(receive_from_plivo(plivo_ws, openai_ws, call_uuid))
             
-            # Process messages from OpenAI
             async for message in openai_ws:
                 await receive_from_openai(message, plivo_ws, openai_ws, call_uuid)
             
-            # Wait for receive task to complete
             await receive_task
     
     except asyncio.CancelledError:
-        logger.info(f'Client disconnected for call {call_uuid}')
+        print(f'Client disconnected for call {call_uuid}')
         await after_call_hangup(call_uuid)
     except websockets.ConnectionClosed:
-        logger.info(f"Connection closed by OpenAI server for call {call_uuid}")
+        print(f"Connection closed by OpenAI server for call {call_uuid}")
         await after_call_hangup(call_uuid)
     except Exception as e:
-        logger.error(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
+        print(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
         await after_call_hangup(call_uuid)
         
 async def receive_from_plivo(plivo_ws, openai_ws, call_uuid):
-    """Receive audio data from Plivo and forward to OpenAI"""
     try:
         while True:
             message = await plivo_ws.receive()
             data = json.loads(message)
-            
             if data['event'] == 'media' and openai_ws.open:
-                # Forward audio data to OpenAI
                 audio_append = {
                     "type": "input_audio_buffer.append",
                     "audio": data['media']['payload']
                 }
                 await openai_ws.send(json.dumps(audio_append))
-                
             elif data['event'] == "start":
-                logger.info(f'Plivo Audio stream has started for call {call_uuid}')
+                print(f'Plivo Audio stream has started for call {call_uuid}')
                 plivo_ws.stream_id = data['start']['streamId']
-                
             elif data['event'] == "hangup":
-                logger.info(f'Call has ended for call {call_uuid}')
+                print(f'Call has ended for call {call_uuid}')
                 await after_call_hangup(call_uuid)
                 if openai_ws.open:
                     await openai_ws.close()
-                break
 
     except websockets.ConnectionClosed:
-        logger.info(f'Connection closed for the plivo audio streaming servers for call {call_uuid}')
+        print(f'Connection closed for the plivo audio streaming servers for call {call_uuid}')
         await after_call_hangup(call_uuid)
         if openai_ws.open:
             await openai_ws.close()
     except Exception as e:
-        logger.error(f"Error during Plivo's websocket communication for call {call_uuid}: {e}")
+        print(f"Error during Plivo's websocket communication for call {call_uuid}: {e}")
         await after_call_hangup(call_uuid)
 
 async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
-    """Process messages received from OpenAI"""
     try:
         response = json.loads(message)
-        response_type = response.get("type", "unknown")
+        print(f'Response received from OpenAI Realtime API for call {call_uuid}: {response["type"]}')
         
-        if response_type == 'session.updated':
-            logger.info(f'Session updated successfully for call {call_uuid}')
-            
-        elif response_type == 'error':
-            logger.error(f'Error from OpenAI for call {call_uuid}: {response}')
-            
-        elif response_type == 'response.text.delta':
+        if response['type'] == 'session.updated':
+           print(f'Session updated successfully for call {call_uuid}')
+        elif response['type'] == 'error':
+            print(f'Error received from realtime api for call {call_uuid}: {response}')
+        elif response['type'] == 'response.text.delta':
             # Store assistant text responses
             if call_uuid in call_data:
                 text_delta = response.get('delta', '')
@@ -277,12 +236,9 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                     for r in call_data[call_uuid]['assistant_responses']:
                         if r.get('item_id') == item_id:
                             r['text'] += text_delta
-                            break
-                            
-        elif response_type == 'response.audio.delta':
-            # Forward audio response to Plivo
+        elif response['type'] == 'response.audio.delta':
             audio_delta = {
-                "event": "playAudio",
+               "event": "playAudio",
                 "media": {
                     "contentType": 'audio/x-mulaw',
                     "sampleRate": 8000,
@@ -290,100 +246,124 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                 }
             }
             await plivo_ws.send(json.dumps(audio_delta))
-            
-        elif response_type == 'response.function_call_arguments.done':
-            # Process function call from OpenAI
-            function_name = response.get('name', '')
+        elif response['type'] == 'response.function_call_arguments.done':
+            print(f'Received function call response for call {call_uuid}: {response}')
             args = json.loads(response['arguments'])
-            item_id = response.get('item_id', '')
-            call_id = response.get('call_id', '')
             
-            logger.info(f'Function call: {function_name} for call {call_uuid}')
-            
-            # Handle different function calls
-            result = None
-            instructions = ''
-            
-            if function_name == 'search_product_database':
+            if response['name'] == 'search_product_database':
                 # Call the RAG function with the query
                 query = args['query']
-                result = await search_product_database(query)
-                instructions = 'Share the product information from the database search with the user in a helpful way.'
+                result = await search_product_database(args['query'])
                 
-            elif function_name == 'get_available_slots':
-                # This function is kept but will rarely be used
-                result = get_available_slots_handler()
-                instructions = 'Share the available appointment slots with the user. Format the times in a clear, easy-to-understand way.'
+                # Record the function call and its result
+                if call_uuid in call_data:
+                    call_data[call_uuid]['function_calls'].append({
+                        'type': 'product_search',
+                        'timestamp': time.time(),
+                        'query': query,
+                        'result': result,
+                        'item_id': response['item_id']
+                    })
                 
-            elif function_name == 'check_slot_availability':
+                # Send the RAG function output back to OpenAI
+                output = function_call_output(result, response['item_id'], response['call_id'])
+                await openai_ws.send(json.dumps(output))
+                
+                # Generate a response using the RAG result
+                generate_response = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8,
+                        "instructions": 'Share the product information from the database search with the user in a helpful way.'
+                    }
+                }
+                print(f"Sending RAG search result response for call {call_uuid}")
+                await openai_ws.send(json.dumps(generate_response))
+            
+            elif response['name'] == 'get_available_slots':
+                # Get available slots from Google Calendar
+                print(f"Getting available appointment slots for call {call_uuid}")
+                slots = get_available_slots_handler()
+                
+                # Record the function call and its result
+                if call_uuid in call_data:
+                    call_data[call_uuid]['function_calls'].append({
+                        'type': 'get_slots',
+                        'timestamp': time.time(),
+                        'query': 'available appointment slots',
+                        'result': slots,
+                        'item_id': response['item_id']
+                    })
+                
+                # Send the calendar function output back to OpenAI
+                output = function_call_output(slots, response['item_id'], response['call_id'])
+                await openai_ws.send(json.dumps(output))
+                
+                # Generate a response with the available slots
+                generate_response = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8,
+                        "instructions": 'Share the available appointment slots with the user. Format the times in a clear, easy-to-understand way.'
+                    }
+                }
+                await openai_ws.send(json.dumps(generate_response))
+                
+            elif response['name'] == 'check_slot_availability':
                 # Check if a specific slot is available
                 proposed_time = args['proposed_time']
+                print(f"Checking slot availability for {proposed_time} in call {call_uuid}")
+                
                 availability = is_slot_available(proposed_time)
                 
-                # Record the function call
+                # Record the function call and its result
                 if call_uuid in call_data:
                     call_data[call_uuid]['function_calls'].append({
                         'type': 'check_availability',
                         'timestamp': time.time(),
-                        'args': args,
-                        'result': {"is_available": availability, "proposed_time": proposed_time},
-                        'item_id': item_id
+                        'proposed_time': proposed_time,
+                        'is_available': availability,
+                        'item_id': response['item_id']
                     })
                 
-                # If slot is available, automatically book it
-                if availability:
-                    email = 'customer@example.com'
-                    
-                    # Use email from database if available
-                    if call_uuid in call_data and call_data[call_uuid]['user_exists'] and call_data[call_uuid]['user_details']:
-                        if call_data[call_uuid]['user_details']['status'] == 'success' and call_data[call_uuid]['user_details']['data'].get('email'):
-                            email = call_data[call_uuid]['user_details']['data']['email']
-                    
-                    # Book the appointment
-                    booking_result = book_slot_handler(proposed_time, email)
-                    
-                    # Record the appointment booking
-                    if call_uuid in call_data:
-                        call_data[call_uuid]['appointments'].append({
-                            'timestamp': time.time(),
-                            'proposed_time': proposed_time,
-                            'email': email,
-                            'result': booking_result,
-                            'item_id': item_id
-                        })
-                    
-                    # Prepare result and instructions
-                    result = {
-                        "is_available": True,
-                        "proposed_time": proposed_time,
-                        "booking_result": booking_result
-                    }
-                    
-                    if 'error' in booking_result:
-                        instructions = f"Tell the user that the time ({proposed_time}) is available, but there was an error booking: {booking_result.get('error')}. Suggest trying again or choosing another time."
-                    else:
-                        instructions = f"Tell the user that the time ({proposed_time}) was available and has been successfully booked. Confirm the appointment details."
-                else:
-                    # Slot is not available
-                    result = {"is_available": False, "proposed_time": proposed_time}
-                    instructions = f"Inform the user that the requested time ({proposed_time}) is not available. Suggest they ask for another time."
+                # Send the calendar function output back to OpenAI
+                output = function_call_output(
+                    {"is_available": availability, "proposed_time": proposed_time}, 
+                    response['item_id'], 
+                    response['call_id']
+                )
+                await openai_ws.send(json.dumps(output))
                 
-            elif function_name == 'book_appointment':
-                # This function is kept for compatibility, but will be rarely called directly now
+                # Generate a response based on availability
+                generate_response = {
+                    "type": "response.create",
+                    "response": {
+                        "modalities": ["text", "audio"],
+                        "temperature": 0.8,
+                        "instructions": f"Tell the user if the requested time ({proposed_time}) is {'available' if availability else 'not available'}."
+                        + (" If not available, suggest they ask for other available slots." if not availability else "")
+                    }
+                }
+                await openai_ws.send(json.dumps(generate_response))
+                
+            elif response['name'] == 'book_appointment':
+                # Book an appointment
                 proposed_time = args['proposed_time']
+                
+                # Use email from database if available, otherwise use provided or default email
                 email = args.get('email', 'customer@example.com')
                 
-                # Use email from database if available
+                # Check if we have user details with email in the database
                 if call_uuid in call_data and call_data[call_uuid]['user_exists'] and call_data[call_uuid]['user_details']:
                     if call_data[call_uuid]['user_details']['status'] == 'success' and call_data[call_uuid]['user_details']['data'].get('email'):
                         email = call_data[call_uuid]['user_details']['data']['email']
+                        print(f"Using email from database for appointment: {email}")
                 
-                result = book_slot_handler(proposed_time, email)
-                instructions = f"Inform the user about the appointment booking result for {proposed_time}."
-                if 'error' in result:
-                    instructions += " Apologize and suggest trying another time slot."
-                else:
-                    instructions += " Confirm the appointment was successfully booked."
+                print(f"Booking appointment for {proposed_time} with {email} in call {call_uuid}")
+                
+                booking_result = book_slot_handler(proposed_time, email)
                 
                 # Record the appointment booking
                 if call_uuid in call_data:
@@ -391,27 +371,28 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                         'timestamp': time.time(),
                         'proposed_time': proposed_time,
                         'email': email,
-                        'result': result,
-                        'item_id': item_id
+                        'result': booking_result,
+                        'item_id': response['item_id']
                     })
-            
-            # Send the function output back to OpenAI
-            if result:
-                output = function_call_output(result, item_id, call_id)
+                
+                # Send the calendar function output back to OpenAI
+                output = function_call_output(booking_result, response['item_id'], response['call_id'])
                 await openai_ws.send(json.dumps(output))
                 
-                # Generate a response using the function result
+                # Generate a response about the booking
                 generate_response = {
                     "type": "response.create",
                     "response": {
                         "modalities": ["text", "audio"],
                         "temperature": 0.8,
-                        "instructions": instructions
+                        "instructions": f"Inform the user about the appointment booking result for {proposed_time}."
+                        + (" Apologize and suggest trying another time slot." if 'error' in booking_result else " Confirm the appointment was successfully booked.")
                     }
                 }
                 await openai_ws.send(json.dumps(generate_response))
                 
-        elif response_type == 'conversation.item.input_audio_transcription.delta':
+        # Handle transcription delta events
+        elif response['type'] == 'conversation.item.input_audio_transcription.delta':
             item_id = response.get('item_id')
             delta = response.get('delta', '')
             
@@ -421,7 +402,10 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                 else:
                     call_data[call_uuid]['transcriptions'][item_id]['text'] += delta
             
-        elif response_type == 'conversation.item.input_audio_transcription.completed':
+            print(f"Transcription delta for call {call_uuid}, item {item_id}: {delta}")
+            
+        # Handle transcription completed events
+        elif response['type'] == 'conversation.item.input_audio_transcription.completed':
             item_id = response.get('item_id')
             full_transcript = response.get('transcript', '')
             
@@ -453,7 +437,7 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                             }
                             await openai_ws.send(json.dumps(update_message))
                             
-                            logger.info(f"Added new user with role: {role}, phone: {caller_number}")
+                            print(f"Added new user with role: {role}, phone: {caller_number}")
                             
                             # Generate a response confirming role registration
                             generate_response = {
@@ -464,40 +448,30 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                                     "instructions": f"Thank the user for specifying they are a {role}. Now continue with normal conversation, offering to help with product information or appointment scheduling."
                                 }
                             }
-                            await openai_ws.send(generate_response)
+                            await openai_ws.send(json.dumps(generate_response))
+            
+            print(f"Transcription completed for call {call_uuid}, item {item_id}: {full_transcript}")
                 
-        elif response_type == 'input_audio_buffer.speech_started':
-            # Clear audio when user starts speaking
+        elif response['type'] == 'input_audio_buffer.speech_started':
+            print(f'Speech started for call {call_uuid}')
             clear_audio_data = {
                 "event": "clearAudio",
                 "stream_id": plivo_ws.stream_id
             }
             await plivo_ws.send(json.dumps(clear_audio_data))
-            
-            # Cancel any in-progress response
             cancel_response = {
                 "type": "response.cancel"
             }
-            await openai_ws.send(cancel_response)
-            
+            await openai_ws.send(json.dumps(cancel_response))
     except Exception as e:
-        logger.error(f"Error processing OpenAI message for call {call_uuid}: {str(e)}")
+        print(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
     
 async def send_session_update(openai_ws, call_uuid):
-    """Send initial session configuration to OpenAI"""
     # Get the current system message for this call
     current_system_message = SYSTEM_MESSAGE
     if call_uuid in call_data:
         current_system_message = call_data[call_uuid]['system_message']
     
-    # Update system message to clarify the simplified appointment booking process
-    current_system_message += """
-    When a user wants to book an appointment, ask them directly for their preferred date and time. 
-    Check if that specific time is available. If available, book it immediately.
-    If not available, inform them and ask for a different time.
-    """
-    
-    # Create session update with tools definitions
     session_update = {
         "type": "session.update",
         "session": {
@@ -520,8 +494,18 @@ async def send_session_update(openai_ws, call_uuid):
                 },
                 {
                     "type": "function",
+                    "name": "get_available_slots",
+                    "description": "Get available appointment slots from the calendar",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},
+                        "required": []
+                    }
+                },
+                {
+                    "type": "function",
                     "name": "check_slot_availability",
-                    "description": "Check if a specific time slot is available for booking and book it if available",
+                    "description": "Check if a specific time slot is available for booking",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -533,21 +517,10 @@ async def send_session_update(openai_ws, call_uuid):
                         "required": ["proposed_time"]
                     }
                 },
-                # Keep these functions for backward compatibility
-                {
-                    "type": "function",
-                    "name": "get_available_slots",
-                    "description": "Get available appointment slots from the calendar (only use if the user specifically asks for available time slots)",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {},
-                        "required": []
-                    }
-                },
                 {
                     "type": "function",
                     "name": "book_appointment",
-                    "description": "Book an appointment at the specified time (only use if check_slot_availability has already confirmed availability)",
+                    "description": "Book an appointment at the specified time",
                     "parameters": {
                         "type": "object",
                         "properties": {
@@ -580,7 +553,6 @@ async def send_session_update(openai_ws, call_uuid):
     await openai_ws.send(json.dumps(session_update))
 
 def function_call_output(result, item_id, call_id):
-    """Format function output for OpenAI"""
     conversation_item = {
         "type": "conversation.item.create",
         "item": {
@@ -596,147 +568,152 @@ async def after_call_hangup(call_uuid):
     """Process transcriptions, generate invoice, and send via WhatsApp for a specific call"""
     # Check if we have data for this call
     if call_uuid not in call_data:
-        logger.warning(f"No call data found for UUID {call_uuid}")
+        print(f"No call data found for UUID {call_uuid}")
         return
         
-    logger.info(f"Processing after-call actions for {call_uuid}")
     call_info = call_data[call_uuid]
+    transcriptions = call_info['transcriptions']
+    function_calls = call_info['function_calls']
+    assistant_responses = call_info.get('assistant_responses', [])
+    appointments = call_info.get('appointments', [])
     
-    try:
-        transcriptions = call_info['transcriptions']
-        function_calls = call_info['function_calls']
-        assistant_responses = call_info.get('assistant_responses', [])
-        appointments = call_info.get('appointments', [])
-        
-        if not transcriptions and not function_calls and not assistant_responses:
-            logger.warning(f"No conversation data recorded for call {call_uuid}")
-            if call_uuid in call_data:
-                del call_data[call_uuid]
-            return
-            
-        # Prepare complete conversation events with timestamps
-        conversation_events = []
-        
-        # Add user transcriptions
-        for item_id, data in transcriptions.items():
-            conversation_events.append({
-                'type': 'user_message',
-                'timestamp': time.time(),  # We don't have actual timestamp in transcriptions
-                'item_id': item_id,
-                'text': data['text']
-            })
-        
-        # Add assistant responses
-        for response in assistant_responses:
-            conversation_events.append({
-                'type': 'assistant_message',
-                'timestamp': response.get('timestamp', time.time()),
-                'item_id': response.get('item_id', 'unknown'),
-                'text': response.get('text', '')
-            })
-        
-        # Add function calls with their actual timestamps
-        for call in function_calls:
-            conversation_events.append({
-                'type': 'function_call',
-                'timestamp': call.get('timestamp', time.time()),
-                'item_id': call.get('item_id', 'unknown'),
-                'call_type': call.get('type', 'unknown'),
-                'data': call
-            })
-        
-        # Add appointments
-        for appt in appointments:
-            conversation_events.append({
-                'type': 'appointment',
-                'timestamp': appt.get('timestamp', time.time()),
-                'item_id': appt.get('item_id', 'unknown'),
-                'proposed_time': appt.get('proposed_time', ''),
-                'result': appt.get('result', {})
-            })
-        
-        # Sort all events by timestamp
-        conversation_events.sort(key=lambda x: x['timestamp'])
-        
-        # Format transcript data as string
-        transcript_text = "CALL TRANSCRIPT & CONVERSATION\n"
-        transcript_text += "============================\n\n"
-        
-        # Track if any appointments were booked
-        booked_appointments = []
-        
-        # Display and format the conversation
-        for event in conversation_events:
-            if event['type'] == 'user_message':
-                transcript_text += f"User: {event['text']}\n\n"
-            elif event['type'] == 'assistant_message':
-                transcript_text += f"Assistant: {event['text']}\n\n"
-            elif event['type'] == 'function_call':
-                if event['call_type'] == 'search_product_database':
-                    transcript_text += f"\nDATABASE QUERY: {event['data'].get('args', {}).get('query', '')}\n"
-                    transcript_text += f"RESULT: {event['data'].get('result', '')}\n\n"
-                elif event['call_type'] in ['get_available_slots', 'check_slot_availability']:
-                    transcript_text += f"\nCALENDAR QUERY: {event['call_type']}\n"
-                    if event['call_type'] == 'check_slot_availability':
-                        transcript_text += f"PROPOSED TIME: {event['data'].get('args', {}).get('proposed_time', '')}\n"
-                        transcript_text += f"AVAILABLE: {event['data'].get('result', {}).get('is_available', False)}\n\n"
-            elif event['type'] == 'appointment':
-                transcript_text += f"\n===== APPOINTMENT BOOKING =====\n"
-                transcript_text += f"Time: {event['proposed_time']}\n"
-                
-                if isinstance(event['result'], dict) and 'error' in event['result']:
-                    transcript_text += f"Status: Failed - {event['result'].get('error', '')}\n\n"
-                else:
-                    transcript_text += f"Status: Successfully booked\n"
-                    transcript_text += f"Calendar Link: {event['result'].get('htmlLink', '')}\n\n"
-                    # Track successful bookings
-                    booked_appointments.append({
-                        'time': event['proposed_time'],
-                        'link': event['result'].get('htmlLink', '')
-                    })
-        
-        # Add a special summary section for appointments at the end
-        if booked_appointments:
-            transcript_text += "\n===== APPOINTMENT SUMMARY =====\n"
-            for idx, appt in enumerate(booked_appointments, 1):
-                transcript_text += f"Appointment #{idx}: {appt['time']}\n"
-                transcript_text += f"Link: {appt.get('link', '')}\n"
-            transcript_text += "==============================\n\n"
-        
-        # Get the caller number from call data
-        caller_number = call_info.get('caller_number', 'unknown')
-        logger.info(f"Sending summary to caller number: {caller_number}")
-        
-        # Generate invoice from transcript data
-        invoice = generate_inquiry_invoice(transcript_text)
-        
-        # Send WhatsApp message with the invoice as PDF
-        if caller_number and caller_number != 'unknown':
-            try:
-                # Create and upload PDF, get shortened URL
-                short_url = upload_text_to_pdf_and_get_short_url(invoice)
-                if short_url:
-                    # Send WhatsApp message with PDF link
-                    send_templated_message(caller_number, short_url, caller_number)
-                    logger.info(f"WhatsApp Template invoice sent successfully to {caller_number} for call {call_uuid}")
-                else:
-                    # Fallback to plain text if PDF creation fails
-                    send_simple_whatsapp(caller_number, invoice)
-                    logger.warning(f"Sent plain text invoice to {caller_number} (PDF creation failed)")
-            except Exception as e:
-                logger.error(f"Failed to send WhatsApp message for call {call_uuid}: {e}")
-        else:
-            logger.warning(f"No valid caller number to send WhatsApp message for call {call_uuid}")
-    
-    except Exception as e:
-        logger.error(f"Error in after-call processing for call {call_uuid}: {str(e)}")
-    finally:
+    if not transcriptions and not function_calls and not assistant_responses:
+        print(f"No conversation data recorded for call {call_uuid}")
         # Clean up call data
         if call_uuid in call_data:
-            logger.info(f"Cleaning up data for call {call_uuid}")
             del call_data[call_uuid]
+        return
+        
+    print(f"\n====== CALL {call_uuid} TRANSCRIPT & CONVERSATION ======")
+    
+    # Prepare complete conversation events with timestamps
+    conversation_events = []
+    
+    # Add user transcriptions
+    for item_id, data in transcriptions.items():
+        conversation_events.append({
+            'type': 'user_message',
+            'timestamp': time.time(),  # We don't have actual timestamp in transcriptions
+            'item_id': item_id,
+            'text': data['text']
+        })
+    
+    # Add assistant responses
+    for response in assistant_responses:
+        conversation_events.append({
+            'type': 'assistant_message',
+            'timestamp': response.get('timestamp', time.time()),
+            'item_id': response.get('item_id', 'unknown'),
+            'text': response.get('text', '')
+        })
+    
+    # Add function calls with their actual timestamps
+    for call in function_calls:
+        conversation_events.append({
+            'type': 'function_call',
+            'timestamp': call.get('timestamp', time.time()),
+            'item_id': call.get('item_id', 'unknown'),
+            'call_type': call.get('type', 'unknown'),
+            'data': call
+        })
+    
+    # Add appointments
+    for appt in appointments:
+        conversation_events.append({
+            'type': 'appointment',
+            'timestamp': appt.get('timestamp', time.time()),
+            'item_id': appt.get('item_id', 'unknown'),
+            'proposed_time': appt.get('proposed_time', ''),
+            'result': appt.get('result', {})
+        })
+    
+    # Sort all events by timestamp
+    conversation_events.sort(key=lambda x: x['timestamp'])
+    
+    # Format transcript data as string
+    transcript_text = "CALL TRANSCRIPT & CONVERSATION\n"
+    transcript_text += "============================\n\n"
+    
+    # Track if any appointments were booked
+    booked_appointments = []
+    
+    # Display and format the conversation
+    for event in conversation_events:
+        if event['type'] == 'user_message':
+            print(f"User: {event['text']}")
+            transcript_text += f"User: {event['text']}\n\n"
+        elif event['type'] == 'assistant_message':
+            print(f"Assistant: {event['text']}")
+            transcript_text += f"Assistant: {event['text']}\n\n"
+        elif event['type'] == 'function_call':
+            if event['call_type'] == 'product_search':
+                print(f"Function Call - Product Search Query: {event['data'].get('query', '')}")
+                print(f"Function Call Result: {event['data'].get('result', '')}\n")
+                transcript_text += f"\nDATABASE QUERY: {event['data'].get('query', '')}\n"
+                transcript_text += f"RESULT: {event['data'].get('result', '')}\n\n"
+            elif event['call_type'] in ['get_slots', 'check_availability']:
+                print(f"Calendar Function - {event['call_type']}")
+                transcript_text += f"\nCALENDAR QUERY: {event['call_type']}\n"
+                if event['call_type'] == 'check_availability':
+                    transcript_text += f"PROPOSED TIME: {event['data'].get('proposed_time', '')}\n"
+                    transcript_text += f"AVAILABLE: {event['data'].get('is_available', False)}\n\n"
+        elif event['type'] == 'appointment':
+            print(f"Appointment: {event['proposed_time']}")
+            print(f"Result: {event['result']}")
+            transcript_text += f"\n===== APPOINTMENT BOOKING =====\n"
+            transcript_text += f"Time: {event['proposed_time']}\n"
+            if 'error' in event['result']:
+                transcript_text += f"Status: Failed - {event['result'].get('error', '')}\n\n"
+            else:
+                transcript_text += f"Status: Successfully booked\n"
+                transcript_text += f"Calendar Link: {event['result'].get('htmlLink', '')}\n\n"
+                # Track successful bookings
+                booked_appointments.append({
+                    'time': event['proposed_time'],
+                    'link': event['result'].get('htmlLink', '')
+                })
+    
+    # Add a special summary section for appointments at the end
+    if booked_appointments:
+        transcript_text += "\n===== APPOINTMENT SUMMARY =====\n"
+        for idx, appt in enumerate(booked_appointments, 1):
+            transcript_text += f"Appointment #{idx}: {appt['time']}\n"
+            transcript_text += f"Link: {appt.get('link', '')}\n"
+        transcript_text += "==============================\n\n"
+    
+    print("============================================\n")
+
+    
+    # Get the caller number from call data
+    caller_number_raw = call_info.get('caller_number', 'unknown')
+    print(f"Raw Caller number for call {call_uuid}: {caller_number_raw}")
+    # Extract valid mobile number using extract_mobile_numbers function
+    valid_numbers = extract_mobile_numbers(caller_number_raw, country="IN")
+    # recipient_number = valid_numbers[0] if valid_numbers else caller_number_raw
+    recipient_number = caller_number_raw
+    # recipient_number = "9779869730965"
+    print(f"Extracted recipient number for call {call_uuid}: {recipient_number}")
+    
+    # Generate invoice from transcript data
+    invoice = generate_inquiry_invoice(transcript_text)
+    print(f"Generated invoice summary for call {call_uuid}:")
+    print(invoice)
+    
+    # Send WhatsApp message with the invoice
+    try:
+        short_url = upload_text_to_pdf_and_get_short_url(invoice)
+        send_templated_message(recipient_number,short_url,caller_number_raw)
+        # send_simple_whatsapp(recipient_number, invoice)
+        print(f"WhatsApp Template invoice sent successfully to {recipient_number} for call {call_uuid}")
+    except Exception as e:
+        print(f"Failed to send WhatsApp message for call {call_uuid}: {e}")
+
+    # Clean up call data
+    if call_uuid in call_data:
+        print(f"Cleaning up data for call {call_uuid}")
+        del call_data[call_uuid]
 
 
 if __name__ == "__main__":
-    logger.info('Starting Technvi VoiceBot server')
-    app.run(host='0.0.0.0', port=PORT)
+    print('running the server')
+    app.run(port=PORT)
