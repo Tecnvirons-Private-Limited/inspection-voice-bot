@@ -236,8 +236,26 @@ def book_slot_handler(start_time_str, email):
         return {"error": f"Failed to book appointment: {str(e)}"}
 
 # Remove test code that runs on import
-if __name__ == "__main__":
-    # Only run when file is executed directly
-    print("Testing calendar functions:")
-    print("Available slots:", get_available_slots_handler())
-
+# Replace the current if __name__ == "__main__" block with this:
+# if __name__ == "__main__":
+#     # Only run when file is executed directly
+#     print("Testing calendar functions:")
+    
+#     # Get available slots first
+#     available_slots = get_available_slots_handler()
+#     print(f"Found {len(available_slots)} available slots")
+    
+#     if available_slots and not isinstance(available_slots, dict):
+#         # Pick the first available slot
+#         test_slot = available_slots[0]
+#         print(f"Testing booking for: {test_slot['display_time']}")
+        
+#         # Test booking with this slot
+#         result = book_slot_handler(
+#             start_time_str=test_slot['start'],
+#             email="aayushgtm5@gmail.com"  # Use a test email
+#         )
+        
+#         print("Booking result:", result)
+#     else:
+#         print("No available slots to test booking or an error occurred")

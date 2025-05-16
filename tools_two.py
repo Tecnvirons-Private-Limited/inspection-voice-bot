@@ -12,12 +12,12 @@ from supabase import create_client
 load_dotenv()
 
 # Initialize Supabase client with service role key to bypass RLS
-supabase_url = os.getenv("SUPABASE_URL")
-supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # Using service role key instead of anon key
+supabase_url = os.getenv("SUPABASE_URLL")
+supabase_key = os.getenv("SUPABASE_SERVICE_ROLE_KEYY")  # Using service role key instead of anon key
 supabase = create_client(supabase_url, supabase_key)
 
 # Bucket name constant
-BUCKET_NAME = "profiles"
+BUCKET_NAME = "billings-data"
 
 def ensure_bucket_exists(bucket_name):
     """Check if bucket exists, create if it doesn't, and ensure it's public"""
@@ -200,7 +200,7 @@ def upload_text_to_pdf_and_get_short_url(text_content, filename_prefix="document
             print(f"Response details: {e.response.text if hasattr(e.response, 'text') else e.response}")
         return None
 
-# # Example usage
+# Example usage
 # text = """Sample Report
 # Date: May 11, 2025
 

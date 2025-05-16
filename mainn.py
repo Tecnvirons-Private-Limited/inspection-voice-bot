@@ -15,6 +15,8 @@ from number import extract_mobile_numbers
 from tools import send_simple_whatsapp, generate_inquiry_invoice, send_templated_message
 from google_calender import get_available_slots_handler, is_slot_available, book_slot_handler
 from tools_two import upload_text_to_pdf_and_get_short_url
+from db import does_number_exist, get_user_details, add_phone_with_role  # Import database functions
+
 # Load environment variables
 load_dotenv(dotenv_path='.env', override=True)
 
@@ -37,15 +39,6 @@ if not OPENAI_API_KEY:
 genai.configure(api_key=GENAI_API_KEY)
 
 # System prompt for the assistant
-# SYSTEM_MESSAGE = (
-#     "You are a helpful assistant for Tec Nvirons who can handle three types of requests: "
-#     "1. General chat - respond conversationally to general inquiries. "
-#     "2. Product database queries - search the product database when users ask about specific products. "
-#     "3. Appointment booking - help users schedule appointments using the calendar functions. "
-#     "When users want to book an appointment, check available slots first, then verify if their requested time is available, "
-#     "and finally book the appointment once confirmed. Always be helpful, friendly, and conversational."
-# )
-
 SYSTEM_MESSAGE = (
     "You are a helpful assistant for Tec Nvirons who can handle three types of requests: "
     "1. General chat - respond conversationally to general inquiries. "
@@ -54,7 +47,17 @@ SYSTEM_MESSAGE = (
     "When users want to book an appointment, either directly verify if their requested time is available, "
     "or check available slots if they haven't specified a time. "
     "Book the appointment once a time is confirmed. Always be helpful, friendly, and conversational."
+
 )
+
+# Additional system prompts for different scenarios
+NEW_USER_SYSTEM_MESSAGE = (
+    "You are a helpful assistant for Tec Nvirons. I see you're a new caller. "
+    "Before we proceed, I need to know if you're a contractor or a customer. "
+    "Please let me know which one you are, and then I can assist you with "
+    "product information, appointment scheduling, or any other questions you have."
+)
+
 app = Quart(__name__)
 
 # Store call data separately for each call UUID
@@ -71,6 +74,26 @@ async def home():
     # Log the incoming call
     print(f"Incoming call from {caller_number} to {called_number} (UUID: {call_uuid})")
     
+    # Check if the caller's number exists in the database
+    user_exists = does_number_exist(caller_number)
+    user_details = None
+    greeting_message = "Welcome to Technvi AI! Please ask anything you want to know about our products or any other questions you may have."
+    system_message_to_use = SYSTEM_MESSAGE
+    
+    if user_exists:
+        # Fetch user details from the database
+        user_details = get_user_details(caller_number)
+        if user_details["status"] == "success":
+            user_name = user_details["data"]["name"]
+            # Personalized greeting for existing users
+            greeting_message = f"Hey {user_name}! Welcome back to Technvi AI. How can I help you today?"
+            print(f"Existing user: {user_name} with email: {user_details['data'].get('email')}")
+    else:
+        # For new users, prompt them to specify their role
+        greeting_message = "Welcome to Technvi AI! I see you're a new caller. Are you a contractor or a customer?"
+        system_message_to_use = NEW_USER_SYSTEM_MESSAGE
+        print(f"New user calling from: {caller_number}")
+    
     # Initialize data structures for this call
     call_data[call_uuid] = {
         'caller_number': caller_number,
@@ -79,12 +102,16 @@ async def home():
         'transcriptions': {},
         'function_calls': [],
         'assistant_responses': [],
-        'appointments': []
+        'appointments': [],
+        'user_exists': user_exists,
+        'user_details': user_details,
+        'user_role_set': False,  # Flag to track if new user has set their role
+        'system_message': system_message_to_use
     }
     
     xml_data = f'''<?xml version="1.0" encoding="UTF-8"?>
     <Response>
-        <Speak voice="Polly.Amy">Welcome to Technvi AI! Please ask anything you want to know about our products or any other questions you may have.</Speak>
+        <Speak voice="Polly.Amy">{greeting_message}</Speak>
         <Stream streamTimeout="86400" keepCallAlive="true" bidirectional="true" contentType="audio/x-mulaw;rate=8000" audioTrack="inbound" >
             ws://{request.host}/media-stream/{call_uuid}
         </Stream>
@@ -108,7 +135,11 @@ async def handle_message(call_uuid):
             'transcriptions': {},
             'function_calls': [],
             'assistant_responses': [],
-            'appointments': []
+            'appointments': [],
+            'user_exists': False,
+            'user_details': None,
+            'user_role_set': False,
+            'system_message': NEW_USER_SYSTEM_MESSAGE
         }
     
     caller_number = call_data[call_uuid]['caller_number']
@@ -119,6 +150,8 @@ async def handle_message(call_uuid):
     plivo_ws.call_uuid = call_uuid
 
     url = "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01"
+    # url = "wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview-2024-12-17"
+
     headers = {
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "OpenAI-Beta": "realtime=v1",
@@ -128,7 +161,7 @@ async def handle_message(call_uuid):
         async with websockets.connect(url, extra_headers=headers) as openai_ws:
             print(f'Connected to the OpenAI Realtime API for call {call_uuid}')
 
-            await send_session_update(openai_ws)
+            await send_session_update(openai_ws, call_uuid)
             
             receive_task = asyncio.create_task(receive_from_plivo(plivo_ws, openai_ws, call_uuid))
             
@@ -317,8 +350,17 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
                 
             elif response['name'] == 'book_appointment':
                 # Book an appointment
-                email = args.get('email', 'customer@example.com')
                 proposed_time = args['proposed_time']
+                
+                # Use email from database if available, otherwise use provided or default email
+                email = args.get('email', 'customer@example.com')
+                
+                # Check if we have user details with email in the database
+                if call_uuid in call_data and call_data[call_uuid]['user_exists'] and call_data[call_uuid]['user_details']:
+                    if call_data[call_uuid]['user_details']['status'] == 'success' and call_data[call_uuid]['user_details']['data'].get('email'):
+                        email = call_data[call_uuid]['user_details']['data']['email']
+                        print(f"Using email from database for appointment: {email}")
+                
                 print(f"Booking appointment for {proposed_time} with {email} in call {call_uuid}")
                 
                 booking_result = book_slot_handler(proposed_time, email)
@@ -369,6 +411,45 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
             
             if call_uuid in call_data:
                 call_data[call_uuid]['transcriptions'][item_id] = {'text': full_transcript, 'complete': True}
+                
+                # For new users, check if they've specified their role
+                if not call_data[call_uuid]['user_exists'] and not call_data[call_uuid]['user_role_set']:
+                    lower_transcript = full_transcript.lower()
+                    
+                    # Check for role specification in the transcript
+                    if 'contractor' in lower_transcript or 'customer' in lower_transcript:
+                        role = 'contractor' if 'contractor' in lower_transcript else 'customer'
+                        caller_number = call_data[call_uuid]['caller_number']
+                        
+                        # Add phone number with role to the database
+                        result = add_phone_with_role(caller_number, role)
+                        
+                        if result['status'] == 'created' or result['status'] == 'exists':
+                            call_data[call_uuid]['user_role_set'] = True
+                            call_data[call_uuid]['system_message'] = SYSTEM_MESSAGE
+                            
+                            # Update session with new system message
+                            update_message = {
+                                "type": "session.update",
+                                "session": {
+                                    "instructions": SYSTEM_MESSAGE
+                                }
+                            }
+                            await openai_ws.send(json.dumps(update_message))
+                            
+                            print(f"Added new user with role: {role}, phone: {caller_number}")
+                            
+                            # Generate a response confirming role registration
+                            generate_response = {
+                                "type": "response.create",
+                                "response": {
+                                    "modalities": ["text", "audio"],
+                                    "temperature": 0.8,
+                                    "instructions": f"Thank the user for specifying they are a {role}. Now continue with normal conversation, offering to help with product information or appointment scheduling."
+                                }
+                            }
+                            await openai_ws.send(json.dumps(generate_response))
+            
             print(f"Transcription completed for call {call_uuid}, item {item_id}: {full_transcript}")
                 
         elif response['type'] == 'input_audio_buffer.speech_started':
@@ -385,7 +466,12 @@ async def receive_from_openai(message, plivo_ws, openai_ws, call_uuid):
     except Exception as e:
         print(f"Error during OpenAI's websocket communication for call {call_uuid}: {e}")
     
-async def send_session_update(openai_ws):
+async def send_session_update(openai_ws, call_uuid):
+    # Get the current system message for this call
+    current_system_message = SYSTEM_MESSAGE
+    if call_uuid in call_data:
+        current_system_message = call_data[call_uuid]['system_message']
+    
     session_update = {
         "type": "session.update",
         "session": {
@@ -454,7 +540,7 @@ async def send_session_update(openai_ws):
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": "alloy",
-            "instructions": SYSTEM_MESSAGE,
+            "instructions": current_system_message,
             "modalities": ["text", "audio"],
             "temperature": 0.8,
             "input_audio_transcription": {
@@ -597,12 +683,15 @@ async def after_call_hangup(call_uuid):
     
     print("============================================\n")
 
+    
     # Get the caller number from call data
     caller_number_raw = call_info.get('caller_number', 'unknown')
-    
+    print(f"Raw Caller number for call {call_uuid}: {caller_number_raw}")
     # Extract valid mobile number using extract_mobile_numbers function
     valid_numbers = extract_mobile_numbers(caller_number_raw, country="IN")
-    recipient_number = valid_numbers[0] if valid_numbers else caller_number_raw
+    # recipient_number = valid_numbers[0] if valid_numbers else caller_number_raw
+    recipient_number = caller_number_raw
+    # recipient_number = "9779869730965"
     print(f"Extracted recipient number for call {call_uuid}: {recipient_number}")
     
     # Generate invoice from transcript data
@@ -613,7 +702,7 @@ async def after_call_hangup(call_uuid):
     # Send WhatsApp message with the invoice
     try:
         short_url = upload_text_to_pdf_and_get_short_url(invoice)
-        send_templated_message(recipient_number,short_url)
+        send_templated_message(recipient_number,short_url,caller_number_raw)
         # send_simple_whatsapp(recipient_number, invoice)
         print(f"WhatsApp Template invoice sent successfully to {recipient_number} for call {call_uuid}")
     except Exception as e:

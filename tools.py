@@ -4,6 +4,7 @@ from plivo import RestClient
 from plivo.utils.template import Template
 import google.generativeai as genai
 from datetime import datetime
+import requests
 
 load_dotenv()
 
@@ -16,7 +17,21 @@ genai.configure(api_key=GENAI_API_KEY)
 
 client = RestClient(auth_id, auth_token)
 
-def send_templated_message(recipient_number, url):
+def send_templated_message(recipient_number, url, number):
+    full_url = f"https://web-production-b5ae9.up.railway.app/?phonenumber={number}"
+
+    shorten_response = requests.post(
+        "https://cleanuri.com/api/v1/shorten",
+        data={"url": full_url},
+    )
+    
+    # Return the shortened URL
+    if shorten_response.status_code == 200:
+        short_web_url = shorten_response.json().get("result_url")
+    else:
+        print(f"Error shortening URL: {shorten_response.text}")
+        short_web_url=  f"https://web-production-b5ae9.up.railway.app/?phonenumber="  # Return original URL if shortening fails
+    short_web_url = short_web_url.replace("https://","")
     url = url.replace("https://","")
     """
     Sends a WhatsApp message using a predefined template with recipient's name in the header.
@@ -27,7 +42,7 @@ def send_templated_message(recipient_number, url):
     """
     # Define the template structure
     template = Template(**{
-        "name": "pdf_integration_template",  # Template name
+        "name": "pdf_regi_template",  # Template name
         "language": "en",
         "components": [
     	{
@@ -36,6 +51,10 @@ def send_templated_message(recipient_number, url):
               {
                         "type": "text",
                         "text": url
+                    },
+                    {
+                        "type": "text",
+                        "text": short_web_url
                     }
     		]
     	}]
